@@ -1,0 +1,310 @@
+import torch
+import torch.nn as nn
+import pandas as pd
+import numpy as np
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler, LabelEncoder
+from torch.utils.data import Dataset, DataLoader
+from sklearn.metrics import mean_squared_error, r2_score
+import math
+
+
+# 数据集类
+class EducationalDataset(Dataset):
+    def __init__(self, features_numeric, features_categorical, targets):
+        self.features_numeric = torch.FloatTensor(features_numeric)
+        self.features_categorical = {k: torch.LongTensor(v) for k, v in features_categorical.items()}
+        self.targets = torch.FloatTensor(targets)
+
+    def __len__(self):
+        return len(self.targets)
+
+    def __getitem__(self, idx):
+        numeric = self.features_numeric[idx]
+        categorical = {k: v[idx] for k, v in self.features_categorical.items()}
+        target = self.targets[idx]
+        return numeric, categorical, target
+
+
+# 数据预处理
+def prepare_data(data_path):
+    df = pd.read_csv(data_path)
+
+    # 首先确定哪些列是分类变量
+    categorical_columns = ['Parental_Involvement', 'Access_to_Resources', 'Peer_Influence',
+                           'School_Type', 'Learning_Disabilities', 'Parental_Education_Level',
+                           'Distance_from_Home', 'Gender']
+
+    # 检查并添加包含Yes/No的列到分类变量中
+    for col in df.columns:
+        if df[col].dtype == 'object':  # 如果列的类型是object（字符串）
+            if col not in categorical_columns and col != 'Exam_Score':
+                categorical_columns.append(col)
+
+    # 确定数值列（排除目标变量和分类变量）
+    numerical_columns = [col for col in df.columns if col not in categorical_columns + ['Exam_Score']]
+
+    print("Categorical columns:", categorical_columns)
+    print("Numerical columns:", numerical_columns)
+
+    # 处理数值特征
+    try:
+        numerical_features = df[numerical_columns].astype(float)
+        scaler = StandardScaler()
+        numerical_features = scaler.fit_transform(numerical_features)
+    except ValueError as e:
+        print(f"Error in numerical columns. Please check these columns: {numerical_columns}")
+        print("Sample values:", df[numerical_columns].head())
+        raise e
+
+    # 处理类别特征
+    categorical_features = {}
+    label_encoders = {}
+    for col in categorical_columns:
+        le = LabelEncoder()
+        categorical_features[col] = le.fit_transform(df[col].astype(str))
+        label_encoders[col] = le
+
+    # 处理目标变量
+    targets = df['Exam_Score'].values
+
+    # 划分训练集和测试集
+    indices = np.arange(len(df))
+    train_idx, test_idx = train_test_split(indices, test_size=0.2, random_state=42)
+
+    # 创建数据集
+    train_dataset = EducationalDataset(
+        numerical_features[train_idx],
+        {k: v[train_idx] for k, v in categorical_features.items()},
+        targets[train_idx]
+    )
+
+    test_dataset = EducationalDataset(
+        numerical_features[test_idx],
+        {k: v[test_idx] for k, v in categorical_features.items()},
+        targets[test_idx]
+    )
+
+    return train_dataset, test_dataset, label_encoders
+
+
+# 位置编码
+class PositionalEncoding(nn.Module):
+    def __init__(self, d_model, dropout=0.1, max_len=5000):
+        super().__init__()
+        self.dropout = nn.Dropout(p=dropout)
+
+        position = torch.arange(max_len).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2) * (-math.log(10000.0) / d_model))
+        pe = torch.zeros(max_len, 1, d_model)
+        pe[:, 0, 0::2] = torch.sin(position * div_term)
+        pe[:, 0, 1::2] = torch.cos(position * div_term)
+        self.register_buffer('pe', pe)
+
+    def forward(self, x):
+        x = x + self.pe[:x.size(0)]
+        return self.dropout(x)
+
+
+# Transformer层
+class EducationalTransformerLayer(nn.Module):
+    def __init__(self, d_model, nhead, dim_feedforward, dropout):
+        super().__init__()
+        self.self_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout)
+        self.feed_forward = nn.Sequential(
+            nn.Linear(d_model, dim_feedforward),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(dim_feedforward, d_model)
+        )
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, src):
+        src2 = self.norm1(src)
+        src = src + self.dropout(self.self_attn(src2, src2, src2)[0])
+        src2 = self.norm2(src)
+        src = src + self.dropout(self.feed_forward(src2))
+        return src
+
+
+# 主模型
+class EducationalTransformer(nn.Module):
+    def __init__(self, num_numerical_features, categorical_feature_dims,
+                 d_model=64, nhead=4, num_layers=3, dim_feedforward=256, dropout=0.1):
+        super().__init__()
+
+        self.numerical_embedding = nn.Linear(num_numerical_features, d_model)
+        self.categorical_embeddings = nn.ModuleDict({
+            feat: nn.Embedding(dim, d_model)
+            for feat, dim in categorical_feature_dims.items()
+        })
+
+        self.positional_encoding = PositionalEncoding(d_model, dropout)
+        self.transformer_layers = nn.ModuleList([
+            EducationalTransformerLayer(d_model, nhead, dim_feedforward, dropout)
+            for _ in range(num_layers)
+        ])
+
+        self.prediction_head = nn.Sequential(
+            nn.Linear(d_model, dim_feedforward),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(dim_feedforward, 1)
+        )
+
+    def forward(self, x_num, x_cat):
+        numeric_embedded = self.numerical_embedding(x_num).unsqueeze(1)
+
+        categorical_embedded = []
+        for feat_name, feat_values in x_cat.items():
+            embedded = self.categorical_embeddings[feat_name](feat_values).unsqueeze(1)
+            categorical_embedded.append(embedded)
+
+        x = torch.cat([numeric_embedded] + categorical_embedded, dim=1)
+        x = self.positional_encoding(x)
+
+        for layer in self.transformer_layers:
+            x = layer(x)
+
+        x = x.mean(dim=1)
+        return self.prediction_head(x).squeeze(-1)
+
+
+# 早停机制
+class EarlyStopping:
+    def __init__(self, patience=7):
+        self.patience = patience
+        self.counter = 0
+        self.best_loss = None
+        self.early_stop = False
+        self.best_model = None
+
+    def __call__(self, val_loss, model):
+        if self.best_loss is None:
+            self.best_loss = val_loss
+            self.best_model = model.state_dict()
+        elif val_loss > self.best_loss:
+            self.counter += 1
+            if self.counter >= self.patience:
+                self.early_stop = True
+        else:
+            self.best_loss = val_loss
+            self.best_model = model.state_dict()
+            self.counter = 0
+        return self.early_stop
+
+
+# 训练函数
+def train_model(model, train_loader, val_loader, num_epochs=100, device='cuda'):
+    model = model.to(device)
+    criterion = nn.MSELoss()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=0.001)
+    early_stopping = EarlyStopping(patience=10)
+
+    for epoch in range(num_epochs):
+        # 训练阶段
+        model.train()
+        train_loss = 0
+        for x_num, x_cat, y in train_loader:
+            x_num = x_num.to(device)
+            x_cat = {k: v.to(device) for k, v in x_cat.items()}
+            y = y.to(device)
+
+            optimizer.zero_grad()
+            y_pred = model(x_num, x_cat)
+            loss = criterion(y_pred, y)
+            loss.backward()
+            optimizer.step()
+
+            train_loss += loss.item()
+
+        # 验证阶段
+        model.eval()
+        val_loss = 0
+        with torch.no_grad():
+            for x_num, x_cat, y in val_loader:
+                x_num = x_num.to(device)
+                x_cat = {k: v.to(device) for k, v in x_cat.items()}
+                y = y.to(device)
+
+                y_pred = model(x_num, x_cat)
+                val_loss += criterion(y_pred, y).item()
+
+        if early_stopping(val_loss / len(val_loader), model):
+            model.load_state_dict(early_stopping.best_model)
+            break
+
+    return model
+
+
+# 评估函数
+def evaluate_model(model, test_loader, device='cuda'):
+    model.eval()
+    predictions = []
+    actuals = []
+
+    with torch.no_grad():
+        for x_num, x_cat, y in test_loader:
+            x_num = x_num.to(device)
+            x_cat = {k: v.to(device) for k, v in x_cat.items()}
+            y_pred = model(x_num, x_cat)
+            predictions.extend(y_pred.cpu().numpy())
+            actuals.extend(y.numpy())
+
+    predictions = np.array(predictions)
+    actuals = np.array(actuals)
+
+    rmse = np.sqrt(mean_squared_error(actuals, predictions))
+    r2 = r2_score(actuals, predictions)
+
+    return {'rmse': rmse, 'r2': r2}
+
+
+# 主程序
+def main():
+    set_seed(42)
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+    # 准备数据
+    train_dataset, test_dataset, label_encoders = prepare_data('data01.csv')
+
+    # 划分训练集和验证集
+    train_size = int(0.8 * len(train_dataset))
+    val_size = len(train_dataset) - train_size
+    train_dataset, val_dataset = torch.utils.data.random_split(train_dataset, [train_size, val_size])
+
+    # 创建数据加载器
+    train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=32)
+    test_loader = DataLoader(test_dataset, batch_size=32)
+
+    # 创建模型
+    num_numerical_features = train_dataset.dataset.features_numeric.shape[1]
+    categorical_feature_dims = {
+        feat: len(encoder.classes_)
+        for feat, encoder in label_encoders.items()
+    }
+
+    model = EducationalTransformer(
+        num_numerical_features=num_numerical_features,
+        categorical_feature_dims=categorical_feature_dims
+    )
+
+    # 训练模型
+    model = train_model(model, train_loader, val_loader, device=device)
+
+    # 评估模型
+    results = evaluate_model(model, test_loader, device=device)
+
+    # 打印结果
+    print("\nTest Results:")
+    print("=" * 30)
+    print(f"RMSE: {results['rmse']:.4f}")
+    print(f"R² Score: {results['r2']:.4f}")
+    print("=" * 30)
+
+
+if __name__ == "__main__":
+    main()
