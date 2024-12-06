@@ -14,7 +14,10 @@ Interpretable Predictions: Provides actionable insights for educational interven
 Model Architecture：
 
 The framework consists of four key components:
+
 <img width="258" alt="image" src="https://github.com/user-attachments/assets/9d4781cd-864b-4253-bd02-aed93ac331d3">
+
+
 
 Feature Processing Layer
 Feature Embedding Layer
